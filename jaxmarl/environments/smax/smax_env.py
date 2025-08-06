@@ -1,20 +1,21 @@
 import dataclasses
-import jax.numpy as jnp
+import io
+import math
+from functools import partial
+from typing import Dict, Tuple
+
+import chex
 import jax
-from jax.experimental import sparse
+import jax.numpy as jnp
+from flax.struct import dataclass
+
 from jaxmarl.environments.multi_agent_env import MultiAgentEnv
-from jaxmarl.environments.spaces import Box, Discrete
 from jaxmarl.environments.smax.distributions import (
     SurroundAndReflectPositionDistribution,
     UniformUnitTypeDistribution,
 )
-import chex
-from typing import Tuple, Dict, Optional
-from flax.struct import dataclass
-from enum import IntEnum
-from functools import partial
-import io
-import math
+from jaxmarl.environments.spaces import Box, Discrete, Space
+from jaxmarl.environments.spaces import Dict as DictSpace
 
 
 @dataclass
@@ -198,7 +199,7 @@ class SMAX(MultiAgentEnv):
         self.max_units_per_section = 2
         self.num_sections = 32
         self.action_type = action_type
-        self.continuous_action_dims = [
+        self.hybrid_action_dims = [
             "shoot_last_enemy",
             "do_shoot",
             "coordinate_1",
@@ -230,7 +231,24 @@ class SMAX(MultiAgentEnv):
             for i, agent in enumerate(self.agents)
         }
 
-    def _get_individual_action_space(self, i):
+    def _get_individual_action_space(self, i: int) -> Space:
+        """Generates action space for each agent.
+
+        Parameters
+        ----------
+        i : int
+            Agent index.
+
+        Returns
+        -------
+        Space
+            Generated action space.
+
+        Raises
+        ------
+        ValueError
+            If unknown unit action type is specified.
+        """
         if self.action_type == "discrete":
             return Discrete(
                 num_categories=(
@@ -239,10 +257,17 @@ class SMAX(MultiAgentEnv):
                     else self.num_enemy_actions
                 )
             )
-        elif self.action_type == "continuous":
-            return Box(low=0.0, high=1.0, shape=(len(self.continuous_action_dims),))
+        elif self.action_type == "hybrid":
+            return DictSpace(
+                {
+                    self.hybrid_action_dims[0]: Discrete(num_categories=2),
+                    self.hybrid_action_dims[1]: Discrete(num_categories=2),
+                    self.hybrid_action_dims[2]: Box(low=-1.0, high=1.0, shape=()),
+                    self.hybrid_action_dims[3]: Box(low=-1.0, high=1.0, shape=()),
+                }
+            )
         else:
-            raise ValueError("")
+            raise ValueError("Unknown action type specified.")
 
     def _get_obs_size(self):
         if self.observation_type == "unit_list":
@@ -261,13 +286,20 @@ class SMAX(MultiAgentEnv):
     @partial(jax.jit, static_argnums=(0,))
     def reset(self, key: chex.PRNGKey) -> Tuple[Dict[str, chex.Array], State]:
         """Environment-specific reset."""
+        # --- Generate unit positions ---
+        # Units can be initialized in SMACv2-style or not
         key, team_0_key, team_1_key = jax.random.split(key, num=3)
-        team_0_start = jnp.stack([jnp.array([self.map_width / 4, self.map_height / 2])] * self.num_allies)
+        team_0_start = jnp.stack(
+            [jnp.array([self.map_width / 4, self.map_height / 2])] * self.num_allies
+        )
         team_0_start_noise = jax.random.uniform(
             team_0_key, shape=(self.num_allies, 2), minval=-2, maxval=2
         )
         team_0_start = team_0_start + team_0_start_noise
-        team_1_start = jnp.stack([jnp.array([self.map_width / 4 * 3, self.map_height / 2])] * self.num_enemies)
+        team_1_start = jnp.stack(
+            [jnp.array([self.map_width / 4 * 3, self.map_height / 2])]
+            * self.num_enemies
+        )
         team_1_start_noise = jax.random.uniform(
             team_1_key, shape=(self.num_enemies, 2), minval=-2, maxval=2
         )
@@ -278,6 +310,8 @@ class SMAX(MultiAgentEnv):
         unit_positions = jax.lax.select(
             self.smacv2_position_generation, generated_unit_positions, unit_positions
         )
+
+        # --- Generate units ---
         unit_teams = jnp.zeros((self.num_agents,))
         unit_teams = unit_teams.at[self.num_allies :].set(1)
         unit_weapon_cooldowns = jnp.zeros((self.num_agents,))
@@ -293,6 +327,8 @@ class SMAX(MultiAgentEnv):
             self.smacv2_unit_type_generation, generated_unit_types, unit_types
         )
         unit_health = self.unit_type_health[unit_types]
+
+        # --- Generate environment state ---
         state = State(
             unit_positions=unit_positions,
             unit_alive=jnp.ones((self.num_agents,), dtype=jnp.bool_),
@@ -305,10 +341,16 @@ class SMAX(MultiAgentEnv):
             terminal=False,
             unit_weapon_cooldowns=unit_weapon_cooldowns,
         )
+        # Take a pass at reducing unit overlap in random positions
         state = self._push_units_away(state)
+
+        # --- Generate observation ---
         obs = self.get_obs(state)
+
+        # --- Generate world state ---
         world_state = self.get_world_state(state)
         obs["world_state"] = jax.lax.stop_gradient(world_state)
+
         return obs, state
 
     @partial(jax.jit, static_argnums=(0, 4))
@@ -478,7 +520,24 @@ class SMAX(MultiAgentEnv):
         )
         return state.replace(unit_health=unit_health)
 
-    def _push_units_away(self, state: State, firmness: float = 1.0):
+    def _push_units_away(self, state: State, firmness: float = 1.0) -> State:
+        """Prevent units from overlapping by adjusting their positions if they’re
+        too close based on their radii and current distance from each other.
+
+        NOTE: This only does a single pass, thus perfect non-overlap isn't guaranteed.
+
+        Parameters
+        ----------
+        state : State
+            Environment state.
+        firmness : float, optional
+            Scaling for pushing units away from one another, by default 1.0
+
+        Returns
+        -------
+        State
+            Updated environment state with new unit positions.
+        """
         delta_matrix = state.unit_positions[:, None] - state.unit_positions[None, :]
         dist_matrix = (
             jnp.linalg.norm(delta_matrix, axis=-1)
@@ -502,8 +561,7 @@ class SMAX(MultiAgentEnv):
     ) -> Tuple[chex.Array, chex.Array]:
         if self.action_type == "discrete":
             return self._decode_discrete_actions(actions)
-        elif self.action_type == "continuous":
-            actions = jnp.clip(actions, 0.0, 1.0)
+        elif self.action_type == "hybrid":
             return self._decode_continuous_actions(key, state, actions)
         else:
             raise ValueError("Invalid Action Type")
@@ -542,31 +600,25 @@ class SMAX(MultiAgentEnv):
     def _decode_continuous_actions(
         self, key, state: State, actions: chex.Array
     ) -> Tuple[chex.Array, chex.Array]:
-        shoot_last_idx = self.continuous_action_dims.index("shoot_last_enemy")
-        action_idx = self.continuous_action_dims.index("do_shoot")
-        theta_idx = self.continuous_action_dims.index("coordinate_2")
-        r_idx = self.continuous_action_dims.index("coordinate_1")
-        shoot_last_enemy_logits = jnp.array(
-            [
-                jnp.log(actions[:, shoot_last_idx]),
-                jnp.log(1 - actions[:, shoot_last_idx]),
-            ]
+        # --- Get action indices ---
+        shoot_last_idx = self.hybrid_action_dims.index("shoot_last_enemy")
+        action_idx = self.hybrid_action_dims.index("do_shoot")
+        r_idx = self.hybrid_action_dims.index("coordinate_1")
+        theta_idx = self.hybrid_action_dims.index("coordinate_2")
+
+        # --- Movement actions ---
+        move_or_shoot = actions[:, action_idx]
+        shoot_last_enemy = actions[:, shoot_last_idx]
+        # Convert movement/targeting from polar to x-y coordinates
+        move_or_shoot_angles = (
+            (jnp.clip(actions[:, theta_idx], -1.0, 1.0) + 1) / 2 * 2 * math.pi
         )
-        logits = jnp.array(
-            [jnp.log(actions[:, action_idx]), jnp.log(1 - actions[:, action_idx])]
-        )
-        move_or_shoot_key, shoot_last_enemy_key = jax.random.split(key)
-        move_or_shoot = jax.random.categorical(move_or_shoot_key, logits, axis=0)
-        shoot_last_enemy = jax.random.categorical(
-            shoot_last_enemy_key, shoot_last_enemy_logits, axis=0
-        )
-        move_angles = jnp.stack([actions[:, theta_idx] * 2 * math.pi], axis=-1)
-        # for the units that didn't move, we want to get a 0 movement vector
-        # we do this by feeding [pi / 2, 0] into [jnp.cos, jnp.sin]
+        # Rescale radius to be between 0 and 1 as a scaling factor
+        radius = (jnp.clip(actions[:, r_idx], -1.0, 1.0) + 1.0) / 2.0
         movement_actions = jnp.stack(
             [
-                actions[:, r_idx] * jnp.cos(move_angles[:, 0]),
-                actions[:, r_idx] * jnp.sin(move_angles[:, 1]),
+                radius * jnp.cos(move_or_shoot_angles),
+                radius * jnp.sin(move_or_shoot_angles),
             ],
             axis=-1,
         )
@@ -575,16 +627,20 @@ class SMAX(MultiAgentEnv):
             movement_actions,
             jnp.zeros_like(movement_actions),
         )
-        # attack actions
-        # convert positions from polar to x-y coordinates
-        positions = jnp.stack(
+
+        # --- Attack actions ---
+        # Scale targeting range by unit's range
+        target_radius = self.unit_type_attack_ranges[state.unit_types] * radius
+        # Create targeting offset vector
+        shoot_positions = jnp.stack(
             [
-                actions[:, r_idx] * jnp.cos(actions[:, theta_idx] * 2 * math.pi),
-                actions[:, r_idx] * jnp.sin(actions[:, theta_idx] * 2 * math.pi),
+                target_radius * jnp.cos(move_or_shoot_angles),
+                target_radius * jnp.sin(move_or_shoot_angles),
             ],
             axis=-1,
         )
-        positions = state.unit_positions + positions
+        # Positions in space the agent is "looking at" for aiming
+        shoot_positions = state.unit_positions + shoot_positions
 
         # get the closest enemy to each of these positions
         def get_attack_action(idx, position):
@@ -600,6 +656,7 @@ class SMAX(MultiAgentEnv):
             shootable = (move_or_shoot[idx] == 1) & jnp.logical_not(
                 team_mask[min_dist_idx]
             )
+            # Calculate index of which agent you're shooting at
             attack_action = jnp.where(
                 team,
                 min_dist_idx - self.num_allies,
@@ -615,7 +672,7 @@ class SMAX(MultiAgentEnv):
             return attack_action
 
         attack_actions = jax.vmap(get_attack_action)(
-            jnp.arange(self.num_agents), positions
+            jnp.arange(self.num_agents), shoot_positions
         )
         return movement_actions, attack_actions
 
@@ -957,7 +1014,10 @@ class SMAX(MultiAgentEnv):
         for key, state, actions in state_seq:
             states = self.step_env(key, state, actions, get_state_sequence=True)
             states = list(map(State, *dataclasses.astuple(states)))
-            viz_actions = {agent: states[0].prev_attack_actions[i] for i, agent in enumerate(self.agents)}
+            viz_actions = {
+                agent: states[0].prev_attack_actions[i]
+                for i, agent in enumerate(self.agents)
+            }
             expanded_state_seq.extend(
                 zip([key] * len(states), states, [viz_actions] * len(states))
             )
@@ -972,9 +1032,8 @@ class SMAX(MultiAgentEnv):
         step: int,
         env_step: int,
     ):
-        from matplotlib.patches import Circle, Rectangle
-        import matplotlib.pyplot as plt
         import numpy as np
+        from matplotlib.patches import Circle, Rectangle
 
         _, state, actions = state
 

@@ -1,17 +1,19 @@
 import dataclasses
-from jaxmarl.environments.smax.smax_env import SMAX
-from jaxmarl.environments.smax.smax_env import State as SMAXState
+from functools import partial
+from typing import Dict, Tuple
+
+import chex
+import jax
+import jax.numpy as jnp
+from flax.struct import dataclass
+
+from jaxmarl.environments.multi_agent_env import MultiAgentEnv
 from jaxmarl.environments.smax.heuristic_enemy import (
     create_heuristic_policy,
     get_heuristic_policy_initial_state,
 )
-from jaxmarl.environments.multi_agent_env import MultiAgentEnv
-import chex
-from typing import Dict, Optional, Tuple
-import jax.numpy as jnp
-import jax
-from flax.struct import dataclass
-from functools import partial
+from jaxmarl.environments.smax.smax_env import SMAX
+from jaxmarl.environments.smax.smax_env import State as SMAXState
 
 
 @dataclass
@@ -48,6 +50,7 @@ class EnemySMAX(MultiAgentEnv):
 
     @partial(jax.jit, static_argnums=(0,))
     def reset(self, key: chex.PRNGKey) -> Tuple[Dict[str, chex.Array], State]:
+        """Environment-specific reset."""
         key, reset_key = jax.random.split(key)
         obs, state = self._env.reset(reset_key)
         enemy_policy_state = self.get_enemy_policy_initial_state(key)
@@ -69,6 +72,7 @@ class EnemySMAX(MultiAgentEnv):
         actions: Dict[str, chex.Array],
         get_state_sequence=False,
     ):
+        """Environment-specific step transition."""
         jaxmarl_state = state.state
         obs = self._env.get_obs(jaxmarl_state)
         enemy_obs = self._env.get_obs_unit_list(jaxmarl_state)
@@ -82,7 +86,7 @@ class EnemySMAX(MultiAgentEnv):
         enemy_movement_actions, enemy_attack_actions = (
             self._env._decode_discrete_actions(enemy_actions)
         )
-        if self._env.action_type == "continuous":
+        if self._env.action_type == "hybrid":
             cont_actions = jnp.zeros((len(self.all_agents), 4))
             cont_actions = cont_actions.at[: self.num_allies].set(actions)
             key, action_key = jax.random.split(key)
@@ -101,7 +105,9 @@ class EnemySMAX(MultiAgentEnv):
         movement_actions = jnp.concatenate(
             [ally_movement_actions, enemy_movement_actions], axis=0
         )
-        attack_actions = jnp.concatenate([ally_attack_actions, enemy_attack_actions], axis=0)
+        attack_actions = jnp.concatenate(
+            [ally_attack_actions, enemy_attack_actions], axis=0
+        )
 
         if not get_state_sequence:
             obs, jaxmarl_state, rewards, dones, infos = self._env.step_env_no_decode(
